@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	deploymentcapnpv1 "github.com/ai-dynamo/dynamo/deploy/operator/internal/dynamo/lpx/manifest/deployment/v1"
+	lpxv1alpha1 "github.com/ai-dynamo/dynamo/deploy/operator/internal/dynamo/lpx/scheduler/v1alpha1"
 )
 
 // BuildFamily identifies the physical LPU target family of a normalized build.
@@ -30,8 +31,7 @@ const (
 // check the execution and scheduling shapes they support.
 type Build struct {
 	// contentID identifies the exact compiler contract used to acquire this build.
-	contentID      string
-	contractFormat buildContractFormat
+	contentID string
 	// path is the absolute file or GCS reference of the build payload.
 	path string
 	// family is the physical LPU target family.
@@ -40,15 +40,7 @@ type Build struct {
 	hasCUDAPartitions bool
 	// partitions contains the normalized physical compiler partitions.
 	partitions []buildPartition
-	// selectedPropSyncChains contains source partition IDs grouped into selected prop-sync chains.
-	selectedPropSyncChains [][]int
-	// lpuUnits retains generated readers and their message through projection.
-	// An empty list selects legacy placement from partitions and chains.
-	lpuUnits deploymentcapnpv1.LpuUnit_List
-	// standaloneTokenEmbeddings reports whether token embeddings occupy a standalone partition.
-	standaloneTokenEmbeddings bool
-	// supportsCPUEmbeddings reports whether standalone token embeddings may run on the CPU.
-	supportsCPUEmbeddings bool
+	lpuUnits   deploymentcapnpv1.LpuUnit_List
 	// ioFPGACount is the number of I/O FPGA endpoints described by the build.
 	ioFPGACount int32
 	// ioFanoutFactor is the number of clients assigned to each I/O FPGA transaction.
@@ -62,35 +54,12 @@ type Build struct {
 
 // buildPartition describes one normalized physical compiler partition.
 type buildPartition struct {
-	// family is explicit for units artifacts, whose legacy topology is not read.
-	family BuildFamily
-	// sourcePartitionID is the compiler partition id used in artifacts and
-	// selected prop-sync chains. It is not the slice index after sorting/filtering.
-	sourcePartitionID int
-	// partPath is the nonempty relative gas-dir fragment under the build payload.
-	partPath string
-	// numChips is the chip count declared by the compiler manifest.
-	numChips int
-	// topology identifies compatible subnode stages for PropSync packing.
-	topology string
-	// devicesPerNode is the number of chips per physical node in the compiler manifest.
+	// family is explicit for units artifacts, whose topology label is not read.
+	family         BuildFamily
 	devicesPerNode int
+	xtShape        lpxv1alpha1.Xt8888PartitionShape
 	// hxExtent is the scheduler-facing four-dimensional HX allocation.
 	hxExtent []int64
-
-	// runtimeNodeCount sums physical endpoints for a collapsed hybrid chain;
-	// numChips retains the original root stage.
-	runtimeNodeCount int
-}
-
-// effectiveNodeCount returns the number of Agent endpoints assigned to the
-// partition. Source partitions derive it from topology; collapsed runtime
-// partitions preserve the sum of their physical scheduler endpoints.
-func (p buildPartition) effectiveNodeCount() int {
-	if p.runtimeNodeCount > 0 {
-		return p.runtimeNodeCount
-	}
-	return max(1, p.numChips/p.devicesPerNode)
 }
 
 // buildRuntimePath resolves a snapshot reference to its runtime filesystem path.

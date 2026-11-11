@@ -8,7 +8,6 @@ package lpx
 import (
 	"fmt"
 	"math"
-	"slices"
 
 	"capnproto.org/go/capnp/v3"
 	commoncapnpv1 "github.com/ai-dynamo/dynamo/deploy/operator/internal/dynamo/lpx/manifest/common/v1"
@@ -17,43 +16,6 @@ import (
 )
 
 const gbuildDeploymentV1CapnpFile = "deployment.v1.capnp.bin"
-
-// buildContractFormat selects a supported compiler contract and runtime entry file.
-type buildContractFormat uint8
-
-const (
-	buildContractUnknown buildContractFormat = iota
-	buildContractManifestV2
-	buildContractDeploymentV1
-)
-
-// selectBuildContract selects exactly one entry point from a normalized inventory.
-func selectBuildContract(inventory []string) (buildContractFormat, error) {
-	legacy := slices.Contains(inventory, gbuildManifestV2CapnpFile)
-	split := slices.Contains(inventory, gbuildDeploymentV1CapnpFile)
-	switch {
-	case legacy && split:
-		return buildContractUnknown, fmt.Errorf("ambiguous build contracts: both %s and %s", gbuildManifestV2CapnpFile, gbuildDeploymentV1CapnpFile)
-	case legacy:
-		return buildContractManifestV2, nil
-	case split:
-		return buildContractDeploymentV1, nil
-	default:
-		return buildContractUnknown, fmt.Errorf("missing build contract: require %s or %s", gbuildManifestV2CapnpFile, gbuildDeploymentV1CapnpFile)
-	}
-}
-
-// filename returns the selected runtime entry point; unknown formats are invalid.
-func (format buildContractFormat) filename() (string, error) {
-	switch format {
-	case buildContractManifestV2:
-		return gbuildManifestV2CapnpFile, nil
-	case buildContractDeploymentV1:
-		return gbuildDeploymentV1CapnpFile, nil
-	default:
-		return "", fmt.Errorf("unsupported build contract format %d", format)
-	}
-}
 
 // decodeGbuildDeploymentV1 reads the scheduler contract without execution/report schemas.
 func decodeGbuildDeploymentV1(data []byte) (deploymentcapnpv1.Deployment, error) {
@@ -88,20 +50,12 @@ func buildFromGbuildDeploymentV1(buildRef string, manifest deploymentcapnpv1.Dep
 	if !deployment.HasProgram() {
 		return nil, fmt.Errorf("%s config.program is missing", gbuildDeploymentV1CapnpFile)
 	}
-	program, err := deployment.Program()
-	if err != nil {
-		return nil, fmt.Errorf("reading %s config.program: %w", gbuildDeploymentV1CapnpFile, err)
-	}
 	rawUnits, err := deployment.LpuUnits()
 	if err != nil {
 		return nil, fmt.Errorf("reading %s config.lpuUnits: %w", gbuildDeploymentV1CapnpFile, err)
 	}
-	var chains [][]int
 	if rawUnits.Len() == 0 {
-		chains, err = selectedPropSyncChainsFromDeploymentV1(deployment)
-		if err != nil {
-			return nil, err
-		}
+		return nil, fmt.Errorf("%s config.lpuUnits is empty; recompile the model with LPU units", gbuildDeploymentV1CapnpFile)
 	}
 	ioFPGACount, ioFanoutFactor, err := runtimeIOFromDeploymentV1(deployment)
 	if err != nil {
@@ -111,18 +65,15 @@ func buildFromGbuildDeploymentV1(buildRef string, manifest deploymentcapnpv1.Dep
 	checkpoint, checkpointErr := checkpointFromDeploymentV1(manifest)
 
 	build := &Build{
-		path:                      buildRef,
-		selectedPropSyncChains:    chains,
-		standaloneTokenEmbeddings: program.StandaloneTokenEmbeddings(),
-		supportsCPUEmbeddings:     program.SupportsCpuEmbeddings(),
-		ioFPGACount:               ioFPGACount,
-		ioFanoutFactor:            ioFanoutFactor,
-		checkpoint:                checkpoint,
-		checkpointErr:             checkpointErr,
+		path:           buildRef,
+		ioFPGACount:    ioFPGACount,
+		ioFanoutFactor: ioFanoutFactor,
+		checkpoint:     checkpoint,
+		checkpointErr:  checkpointErr,
 	}
 
 	// Complete the normalized build with scheduler-facing LPU artifacts.
-	if err := addLPUArtifactsFromDeploymentV1(manifest, build, rawUnits.Len() != 0); err != nil {
+	if err := addLPUArtifactsFromDeploymentV1(manifest, build); err != nil {
 		return nil, err
 	}
 
@@ -223,39 +174,9 @@ func runtimeIOFromDeploymentV1(deployment deploymentcapnpv1.DeploymentInfo) (int
 	return int32(count), int32(fanoutFactor), nil
 }
 
-func selectedPropSyncChainsFromDeploymentV1(deployment deploymentcapnpv1.DeploymentInfo) ([][]int, error) {
-	if !deployment.HasSelectedPropSyncChains() {
-		return nil, nil
-	}
-	rawChains, err := deployment.SelectedPropSyncChains()
-	if err != nil {
-		return nil, fmt.Errorf("reading %s config.selectedPropSyncChains: %w", gbuildDeploymentV1CapnpFile, err)
-	}
-	chains := make([][]int, 0, rawChains.Len())
-	for chainIndex := 0; chainIndex < rawChains.Len(); chainIndex++ {
-		rawChain := rawChains.At(chainIndex)
-		if !rawChain.HasPartitionIds() {
-			return nil, fmt.Errorf("%s config.selectedPropSyncChains[%d].partitionIds is missing", gbuildDeploymentV1CapnpFile, chainIndex)
-		}
-		rawIDs, err := rawChain.PartitionIds()
-		if err != nil {
-			return nil, fmt.Errorf("reading %s config.selectedPropSyncChains[%d].partitionIds: %w", gbuildDeploymentV1CapnpFile, chainIndex, err)
-		}
-
-		chainPath := fmt.Sprintf("%s config.selectedPropSyncChains[%d]", gbuildDeploymentV1CapnpFile, chainIndex)
-		chain, err := decodePropSyncChain(rawIDs, chainPath)
-		if err != nil {
-			return nil, err
-		}
-		chains = append(chains, chain)
-	}
-	return chains, nil
-}
-
 func addLPUArtifactsFromDeploymentV1(
 	artifacts deploymentcapnpv1.Deployment,
 	build *Build,
-	units bool,
 ) error {
 	rawPartitions, err := artifacts.Partitions()
 	if err != nil {
@@ -263,12 +184,12 @@ func addLPUArtifactsFromDeploymentV1(
 	}
 	partitions := make([]buildPartition, 0, rawPartitions.Len())
 	for index := 0; index < rawPartitions.Len(); index++ {
-		partition, err := buildPartitionFromDeploymentV1(rawPartitions.At(index), units)
+		partition, err := buildPartitionFromDeploymentV1(rawPartitions.At(index))
 		if err != nil {
 			return err
 		}
 		// Project LPU artifacts while retaining whether the build also requires CUDA.
-		if partition.partPath != "" {
+		if partition.family != "" {
 			partitions = append(partitions, partition)
 		} else {
 			ref, err := rawPartitions.At(index).Partition()
@@ -284,19 +205,12 @@ func addLPUArtifactsFromDeploymentV1(
 	// Units already encode inventory order and ownership. One Agent template
 	// still requires a common target family and device width across the build.
 	family := partitions[0].family
-	if units {
-		for _, partition := range partitions {
-			if partition.family != family {
-				return fmt.Errorf("%s mixes XT and HX LPU partitions", gbuildDeploymentV1CapnpFile)
-			}
-			if partition.devicesPerNode != partitions[0].devicesPerNode {
-				return fmt.Errorf("all LPU partitions must use the same devicesPerNode")
-			}
+	for _, partition := range partitions {
+		if partition.family != family {
+			return fmt.Errorf("%s mixes XT and HX LPU partitions", gbuildDeploymentV1CapnpFile)
 		}
-	} else {
-		family, err = classifyManifestPartitions(gbuildDeploymentV1CapnpFile, partitions, artifacts.HasPartSelect())
-		if err != nil {
-			return err
+		if partition.devicesPerNode != partitions[0].devicesPerNode {
+			return fmt.Errorf("all LPU partitions must use the same devicesPerNode")
 		}
 	}
 
@@ -307,7 +221,7 @@ func addLPUArtifactsFromDeploymentV1(
 	return nil
 }
 
-func buildPartitionFromDeploymentV1(raw deploymentcapnpv1.PartitionDeployment, units bool) (buildPartition, error) {
+func buildPartitionFromDeploymentV1(raw deploymentcapnpv1.PartitionDeployment) (buildPartition, error) {
 	if !raw.HasPartition() {
 		return buildPartition{}, fmt.Errorf("%s artifact partition is missing partition ref", gbuildDeploymentV1CapnpFile)
 	}
@@ -337,20 +251,9 @@ func buildPartitionFromDeploymentV1(raw deploymentcapnpv1.PartitionDeployment, u
 	default:
 		return buildPartition{}, fmt.Errorf("%s LPU partition %d unsupported chip architecture %d", gbuildDeploymentV1CapnpFile, ref.PartitionId(), detail.Architecture())
 	}
-	if units {
-		width, err := positiveManifestUInt32ToInt("LPU partition devicesPerNode", detail.DevicesPerNode())
-		if err != nil {
-			return buildPartition{}, err
-		}
-		path, err := detail.Path()
-		if err != nil {
-			return buildPartition{}, fmt.Errorf("reading LPU partition path: %w", err)
-		}
-		path, err = cleanManifestRelativeBuildPath("LPU partition path", path)
-		if err != nil {
-			return buildPartition{}, err
-		}
-		return buildPartition{sourcePartitionID: int(ref.PartitionId()), partPath: path, devicesPerNode: width, family: family}, nil
+	width := detail.DevicesPerNode()
+	if width == 0 {
+		return buildPartition{}, fmt.Errorf("LPU partition devicesPerNode must be >= 1, got 0")
 	}
-	return buildLPUArtifact(gbuildDeploymentV1CapnpFile, ref.PartitionId(), detail, family)
+	return buildPartition{devicesPerNode: int(width), family: family}, nil
 }

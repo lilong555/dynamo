@@ -17,7 +17,13 @@ import (
 // Bump this domain when projection behavior changes for the same compiler bytes.
 const unitsProjectionVersion = "lpu-units-node-local/v1"
 
-func appendUnitModelProjections(dst []*ModelProjection, intent ModelProjectionInput) ([]*ModelProjection, error) {
+// appendModelProjections appends one component's immutable model projections to
+// the caller-owned destination, which may be nil. Existing elements are unchanged.
+// intent.Build contains a normalized, non-nil build; Models is nonempty
+// and Pipeline is selected by the validated resolver. Source inputs are not mutated;
+// discard error results.
+func appendModelProjections(dst []*ModelProjection, intent ModelProjectionInput) ([]*ModelProjection, error) {
+	firstProjection := len(dst)
 	build := intent.Build
 	hybrid := intent.Pipeline == PipelineHybrid
 
@@ -32,9 +38,6 @@ func appendUnitModelProjections(dst []*ModelProjection, intent ModelProjectionIn
 	}
 
 	devicesPerNode := build.partitions[0].devicesPerNode
-	if build.family == BuildFamilyXT && devicesPerNode != 8 {
-		return nil, fmt.Errorf("%w: LP20 nodes projection requires devicesPerNode=8, got %d", ErrUnsupportedRuntime, devicesPerNode)
-	}
 
 	var (
 		partitions    = make([]buildPartition, 0, len(units))
@@ -73,9 +76,6 @@ func appendUnitModelProjections(dst []*ModelProjection, intent ModelProjectionIn
 		}
 	}
 
-	// The scheduler reads placement from partitions and connectors alone.
-	allocationMetadata := json.RawMessage(`{}`)
-
 	// The compiler content ID covers placement and runtime I/O. Only operator
 	// inputs need separate fields in the coordination revision.
 	for index, model := range intent.Models {
@@ -92,17 +92,39 @@ func appendUnitModelProjections(dst []*ModelProjection, intent ModelProjectionIn
 		dst = append(dst, &ModelProjection{
 			digest:                 transcript.sum(),
 			compilerSnapshotDigest: build.contentID,
-			contractFormat:         build.contractFormat,
 			runtimeBuildRef:        intent.RuntimeBuildRef,
 			model:                  intent.Models[index],
 			pipeline:               intent.Pipeline,
 			configuredBuild:        *build,
-			allocationMetadata:     allocationMetadata,
 			partitions:             partitions,
 			connectors:             connectors,
 			agentReplicas:          agentReplicas,
 			localPartitionIDs:      localPartitionIDs,
 		})
+	}
+	// Only a hybrid build's Cyborg conductor consumes a checkpoint.
+	var checkpoint *Checkpoint
+	if intent.Pipeline == PipelineHybrid {
+		if err := intent.Build.checkpointErr; err != nil {
+			return nil, err
+		}
+		checkpoint = intent.Build.checkpoint
+	}
+	for _, projection := range dst[firstProjection:] {
+		projection.checkpoint = checkpoint
+	}
+
+	// Bound the component's physical build before runtime expansion and request publication.
+	projection := dst[firstProjection]
+	boundedPartitions := len(projection.partitions)
+	if len(projection.localPartitionIDs) > 0 {
+		// A local selection may leave no remote partitions, but the build itself stays bounded.
+		boundedPartitions = len(intent.Build.partitions)
+	} else if boundedPartitions < 1 {
+		return nil, fmt.Errorf("LPX projection has %d partitions, limit is 1..%d", boundedPartitions, maxLPXPartitions)
+	}
+	if boundedPartitions > maxLPXPartitions {
+		return nil, fmt.Errorf("LPX projection has %d partitions, limit is 1..%d", boundedPartitions, maxLPXPartitions)
 	}
 	return dst, nil
 }
@@ -112,7 +134,7 @@ func projectUnitReservation(reservation deploymentcapnpv1.LpuReservation, family
 	if err != nil {
 		return buildPartition{}, 0, err
 	}
-	partition := buildPartition{sourcePartitionID: root, devicesPerNode: devicesPerNode}
+	partition := buildPartition{devicesPerNode: devicesPerNode}
 	hosts, extent, err := reservationSize(reservation, devicesPerNode)
 	if err != nil {
 		return buildPartition{}, 0, err
@@ -120,14 +142,13 @@ func projectUnitReservation(reservation deploymentcapnpv1.LpuReservation, family
 	if family == BuildFamilyXT && extent != nil {
 		return buildPartition{}, 0, fmt.Errorf("%w: LP20 reservations require size.nodes, not size.hx", ErrUnsupportedRuntime)
 	}
-	partition.numChips = hosts * devicesPerNode
 	partition.hxExtent = extent
 	if family == BuildFamilyHX {
 		if len(partition.hxExtent) == 0 {
-			if hosts != 1 || devicesPerNode != 16 {
-				return buildPartition{}, 0, fmt.Errorf("%w: LP30 size.nodes requires one host with devicesPerNode=16; use a supported size.hx", ErrUnsupportedRuntime)
+			if hosts != 1 {
+				return buildPartition{}, 0, fmt.Errorf("%w: LP30 size.nodes requires one host; use size.hx for multiple hosts", ErrUnsupportedRuntime)
 			}
-			partition.hxExtent = []int64{16, 1, 1, 1}
+			partition.hxExtent = []int64{int64(devicesPerNode), 1, 1, 1}
 		}
 	}
 
@@ -135,8 +156,12 @@ func projectUnitReservation(reservation deploymentcapnpv1.LpuReservation, family
 	// c128), so a host count without a registered shape has no request
 	// encoding.
 	if family == BuildFamilyXT {
-		if _, err := xtShape(partition); err != nil {
-			return buildPartition{}, 0, err
+		chips := hosts * 8
+		switch chips {
+		case 8, 16, 24, 32, 40, 48, 56, 64, 96, 128:
+			partition.xtShape = lpxv1alpha1.Xt8888PartitionShape(fmt.Sprintf("c%d", chips))
+		default:
+			return buildPartition{}, 0, fmt.Errorf("partition %d has unregistered XT shape c%d", root, chips)
 		}
 	}
 	return partition, hosts, nil
